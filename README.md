@@ -1,5 +1,7 @@
 # @openclaw/vk
 
+> **Early WIP — not ready for use.** This plugin is under active development and should not be used yet.
+
 VK (VKontakte) channel plugin for OpenClaw. Uses VK Bot Long Poll API with zero dependencies (raw `fetch`).
 
 ## Setup
