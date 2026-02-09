@@ -1,12 +1,16 @@
 import { getVkRuntime } from "./runtime.js";
 import { getVkLog } from "./runtime.js";
 import { resolveVkAccount } from "./types.js";
+import type { VkAttachment } from "./types.js";
 import {
   sendVkMessage,
   getGroupInfo,
   getLongPollServer,
   pollLongPoll,
   resolveScreenName,
+  fetchVkAttachment,
+  uploadPhotoForMessage,
+  uploadDocForMessage,
 } from "./vk-api.js";
 
 interface MonitorOpts {
@@ -16,11 +20,108 @@ interface MonitorOpts {
   setStatus?: (patch: Record<string, unknown>) => void;
 }
 
+interface DownloadedMedia {
+  path: string;
+  contentType: string;
+  placeholder: string;
+}
+
 const DEDUP_CAP = 2000;
 const RECONNECT_DELAY_MS = 3000;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Pick the best photo URL from the VK sizes array (largest available).
+function pickPhotoUrl(sizes: { type: string; url: string }[]): string | undefined {
+  const preference = ["w", "z", "y", "x", "r", "q", "p", "o", "m", "s"];
+  for (const t of preference) {
+    const s = sizes.find((sz) => sz.type === t);
+    if (s) return s.url;
+  }
+  return sizes[sizes.length - 1]?.url;
+}
+
+// Download a VK attachment and save it to the media store.
+// Returns null for unsupported types.
+async function downloadAttachment(
+  att: VkAttachment,
+  core: ReturnType<typeof getVkRuntime>,
+  log: ReturnType<typeof getVkLog>,
+): Promise<DownloadedMedia | null> {
+  try {
+    switch (att.type) {
+      case "photo": {
+        const url = pickPhotoUrl(att.photo.sizes);
+        if (!url) return null;
+        const { buffer, contentType } = await fetchVkAttachment(url);
+        const saved = await core.channel.media.saveMediaBuffer(buffer, contentType, "inbound");
+        return { path: saved.path, contentType: saved.contentType ?? contentType, placeholder: "<media:image>" };
+      }
+      case "doc": {
+        const { buffer, contentType } = await fetchVkAttachment(att.doc.url);
+        const saved = await core.channel.media.saveMediaBuffer(buffer, contentType, "inbound");
+        return { path: saved.path, contentType: saved.contentType ?? contentType, placeholder: "<media:document>" };
+      }
+      case "audio_message": {
+        const url = att.audio_message.link_ogg || att.audio_message.link_mp3;
+        if (!url) return null;
+        const { buffer, contentType } = await fetchVkAttachment(url);
+        const saved = await core.channel.media.saveMediaBuffer(buffer, contentType, "inbound");
+        return { path: saved.path, contentType: saved.contentType ?? contentType, placeholder: "<media:audio>" };
+      }
+      case "sticker": {
+        const images = att.sticker.images;
+        const url = images[images.length - 1]?.url;
+        if (!url) return null;
+        const { buffer, contentType } = await fetchVkAttachment(url);
+        const saved = await core.channel.media.saveMediaBuffer(buffer, contentType, "inbound");
+        return { path: saved.path, contentType: saved.contentType ?? contentType, placeholder: "<media:sticker>" };
+      }
+      case "graffiti": {
+        const { buffer, contentType } = await fetchVkAttachment(att.graffiti.url);
+        const saved = await core.channel.media.saveMediaBuffer(buffer, contentType, "inbound");
+        return { path: saved.path, contentType: saved.contentType ?? contentType, placeholder: "<media:image>" };
+      }
+      default:
+        return null;
+    }
+  } catch (err) {
+    log.error(`failed to download ${att.type} attachment: ${String(err)}`);
+    return null;
+  }
+}
+
+// Upload a media file to VK and return the attachment string for messages.send.
+async function uploadMediaToVk(
+  token: string,
+  peerId: number,
+  buffer: Buffer,
+  contentType: string,
+  kind: string,
+  audioAsVoice: boolean,
+  log: ReturnType<typeof getVkLog>,
+): Promise<string | null> {
+  try {
+    const ext = contentType.split("/")[1]?.split(";")[0] ?? "bin";
+    if (kind === "image") {
+      return await uploadPhotoForMessage(token, peerId, buffer, `image.${ext}`);
+    }
+    if (kind === "audio") {
+      // VK audio_message requires OGG Opus; use it for ogg, fall back to doc for other audio
+      const isOgg = contentType.includes("ogg");
+      if (isOgg) {
+        return await uploadDocForMessage(token, peerId, buffer, `voice.ogg`, "audio_message");
+      }
+      return await uploadDocForMessage(token, peerId, buffer, `audio.${ext}`, "doc");
+    }
+    // Everything else (documents, video, unknown) → doc upload
+    return await uploadDocForMessage(token, peerId, buffer, `file.${ext}`, "doc");
+  } catch (err) {
+    log.error(`failed to upload media to VK: ${String(err)}`);
+    return null;
+  }
 }
 
 // Long Poll monitor loop. Polls VK for new messages and dispatches
@@ -118,9 +219,10 @@ export async function monitorVkProvider(opts: MonitorOpts): Promise<void> {
       const peerId: number = msg.peer_id;
       const text: string = msg.text ?? "";
       const messageId: number = msg.id;
+      const attachments: VkAttachment[] = msg.attachments ?? [];
 
-      // Skip empty messages
-      if (!text) continue;
+      // Skip messages with no text and no attachments
+      if (!text && attachments.length === 0) continue;
 
       // Dedup: skip already-seen message IDs
       if (seen.has(messageId)) continue;
@@ -140,6 +242,18 @@ export async function monitorVkProvider(opts: MonitorOpts): Promise<void> {
         continue;
       }
 
+      // Download inbound attachments
+      const media: DownloadedMedia[] = [];
+      for (const att of attachments) {
+        const result = await downloadAttachment(att, core, log);
+        if (result) media.push(result);
+      }
+
+      // Build body text: original text + placeholders for media-only messages
+      const placeholders = media.map((m) => m.placeholder);
+      const bodyText = text || placeholders.join(" ");
+      const rawBody = text || placeholders.join(" ");
+
       const chatType = peerId >= 2000000000 ? "group" : "direct";
       const fromLabel = `vk:${fromId}`;
 
@@ -156,14 +270,14 @@ export async function monitorVkProvider(opts: MonitorOpts): Promise<void> {
         channel: "VK",
         from: fromLabel,
         timestamp: msg.date * 1000,
-        body: text,
+        body: bodyText,
       });
 
       // Build the full inbound context payload
       const ctxPayload = core.channel.reply.finalizeInboundContext({
         Body: body,
-        RawBody: text,
-        CommandBody: text,
+        RawBody: rawBody,
+        CommandBody: rawBody,
         From: fromLabel,
         To: `vk:${groupId}`,
         SessionKey: route.sessionKey,
@@ -173,6 +287,15 @@ export async function monitorVkProvider(opts: MonitorOpts): Promise<void> {
         Surface: "vk",
         MessageSid: String(messageId),
         OriginatingChannel: "vk",
+        // Media fields (following Telegram's pattern: paths for both Path and Url)
+        ...(media.length > 0 && {
+          MediaPath: media[0].path,
+          MediaUrl: media[0].path,
+          MediaType: media[0].contentType,
+          MediaPaths: media.map((m) => m.path),
+          MediaUrls: media.map((m) => m.path),
+          MediaTypes: media.map((m) => m.contentType),
+        }),
       });
 
       // Track inbound timestamp in gateway runtime
@@ -184,8 +307,39 @@ export async function monitorVkProvider(opts: MonitorOpts): Promise<void> {
         cfg,
         dispatcherOptions: {
           deliver: async (payload: any) => {
-            if (payload.text) {
-              await sendVkMessage(token, peerId, payload.text);
+            const mediaUrls: string[] =
+              payload.mediaUrls ?? (payload.mediaUrl ? [payload.mediaUrl] : []);
+            const audioAsVoice = payload.audioAsVoice === true;
+
+            // Upload each media URL and collect attachment strings
+            const attachmentStrings: string[] = [];
+            const failedUrls: string[] = [];
+            for (const url of mediaUrls) {
+              if (!url) continue;
+              try {
+                const loaded = await core.media.loadWebMedia(url);
+                const kind = core.media.mediaKindFromMime(loaded.contentType ?? "");
+                const attStr = await uploadMediaToVk(
+                  token, peerId, loaded.buffer, loaded.contentType ?? "application/octet-stream",
+                  kind, audioAsVoice, log,
+                );
+                if (attStr) attachmentStrings.push(attStr);
+                else failedUrls.push(url);
+              } catch (err) {
+                log.error(`[${accountId}] failed to load/upload media ${url}: ${String(err)}`);
+                failedUrls.push(url);
+              }
+            }
+
+            const attachment = attachmentStrings.length > 0
+              ? attachmentStrings.join(",")
+              : undefined;
+
+            // Fallback: include failed media URLs in the text so they're not silently dropped
+            const msgText = [payload.text, ...failedUrls].filter(Boolean).join("\n");
+
+            if (msgText || attachment) {
+              await sendVkMessage(token, peerId, msgText, attachment);
               opts.setStatus?.({ lastOutboundAt: Date.now() });
             }
           },

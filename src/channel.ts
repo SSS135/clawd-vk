@@ -1,9 +1,10 @@
 import type { ChannelPlugin, OpenClawConfig } from "openclaw/plugin-sdk";
 import type { VkResolvedAccount } from "./types.js";
 import { resolveVkAccount, setVkConfig } from "./types.js";
-import { vkApi, getGroupInfo } from "./vk-api.js";
+import { vkApi, getGroupInfo, uploadPhotoForMessage, uploadDocForMessage } from "./vk-api.js";
 import { monitorVkProvider } from "./monitor.js";
 import { vkOnboardingAdapter } from "./onboarding.js";
+import { getVkRuntime, getVkLog } from "./runtime.js";
 
 // Flat JSON Schema for cfg.channels.vk — no accounts nesting, no dmPolicy
 const vkChannelConfigSchema = {
@@ -30,13 +31,8 @@ const vkChannelConfigSchema = {
   },
 };
 
-// Shared send logic used by both sendText and sendMedia
-async function deliverText(
-  cfg: OpenClawConfig,
-  _accountId: string,
-  to: string,
-  text: string,
-): Promise<{ channel: "vk"; messageId: string }> {
+// Resolve account and peer_id, validate config
+function resolveTarget(cfg: OpenClawConfig, to: string) {
   const acct = resolveVkAccount(cfg);
   if (!acct.configured) {
     throw new Error(`VK is not configured (missing token or groupId)`);
@@ -45,9 +41,60 @@ async function deliverText(
   if (Number.isNaN(peerId)) {
     throw new Error(`Invalid VK peer_id: ${to}`);
   }
+  return { acct, peerId };
+}
+
+// Send a text-only message
+async function deliverText(
+  cfg: OpenClawConfig,
+  _accountId: string,
+  to: string,
+  text: string,
+): Promise<{ channel: "vk"; messageId: string }> {
+  const { acct, peerId } = resolveTarget(cfg, to);
   const messageId = await vkApi(acct.token, "messages.send", {
     peer_id: peerId,
     message: text,
+    random_id: Math.floor(Math.random() * 2 ** 31),
+  });
+  return { channel: "vk", messageId: String(messageId) };
+}
+
+// Send a message with a media attachment
+async function deliverMedia(
+  cfg: OpenClawConfig,
+  _accountId: string,
+  to: string,
+  text: string,
+  mediaUrl: string,
+): Promise<{ channel: "vk"; messageId: string }> {
+  const { acct, peerId } = resolveTarget(cfg, to);
+  const log = getVkLog();
+  const core = getVkRuntime();
+
+  let attachment: string | undefined;
+  try {
+    const loaded = await core.media.loadWebMedia(mediaUrl);
+    const kind = core.media.mediaKindFromMime(loaded.contentType ?? "");
+    const ext = (loaded.contentType ?? "").split("/")[1]?.split(";")[0] ?? "bin";
+
+    if (kind === "image") {
+      attachment = await uploadPhotoForMessage(acct.token, peerId, loaded.buffer, `image.${ext}`);
+    } else if (kind === "audio" && (loaded.contentType ?? "").includes("ogg")) {
+      attachment = await uploadDocForMessage(acct.token, peerId, loaded.buffer, `voice.ogg`, "audio_message");
+    } else {
+      attachment = await uploadDocForMessage(acct.token, peerId, loaded.buffer, loaded.fileName ?? `file.${ext}`, "doc");
+    }
+  } catch (err) {
+    log.error(`VK sendMedia upload failed: ${String(err)}`);
+  }
+
+  // Send with attachment if upload succeeded, otherwise fall back to text + URL
+  const msgText = attachment ? text : [text, mediaUrl].filter(Boolean).join("\n");
+  const messageId = await vkApi(acct.token, "messages.send", {
+    peer_id: peerId,
+    ...(msgText ? { message: msgText } : {}),
+    ...(attachment ? { attachment } : {}),
     random_id: Math.floor(Math.random() * 2 ** 31),
   });
   return { channel: "vk", messageId: String(messageId) };
@@ -62,7 +109,7 @@ export const vkPlugin: ChannelPlugin<VkResolvedAccount> = {
     docsPath: "/channels/vk",
     blurb: "VK Bot API via Long Poll",
   },
-  capabilities: { chatTypes: ["direct", "group"] },
+  capabilities: { chatTypes: ["direct", "group"], media: true },
   configSchema: vkChannelConfigSchema,
   onboarding: vkOnboardingAdapter,
 
@@ -124,8 +171,7 @@ export const vkPlugin: ChannelPlugin<VkResolvedAccount> = {
     },
 
     async sendMedia({ cfg, to, text, mediaUrl, accountId }) {
-      const combined = [text, mediaUrl].filter(Boolean).join("\n");
-      return deliverText(cfg, accountId, to, combined);
+      return deliverMedia(cfg, accountId, to, text, mediaUrl ?? "");
     },
   },
 
