@@ -1,0 +1,25 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:dev.vk.com)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebSearch",
+      "Bash(dir:*)",
+      "WebFetch(domain:evilcoder.ru)",
+      "WebFetch(domain:sudonull.com)",
+      "WebFetch(domain:www.npmjs.com)",
+      "Bash(npm view:*)",
+      "WebFetch(domain:vk-api.readthedocs.io)",
+      "WebFetch(domain:vknet.github.io)",
+      "Bash(python:*)",
+      "WebFetch(domain:vk.com)",
+      "Bash(gh api:*)",
+      "Bash(find:*)",
+      "Bash(curl:*)",
+      "WebFetch(domain:helperbyte.com)",
+      "Bash(echo:*)",
+      "WebFetch(domain:docs.openclaw.ai)"
+    ]
+  }
+}
