@@ -1,20 +1,16 @@
 import type { OpenClawConfig } from "openclaw/plugin-sdk";
 
-// Per-account settings stored in config at cfg.channels.vk.accounts[id]
-export interface VkAccount {
+// Flat channel config at cfg.channels.vk
+export interface VkConfig {
+  enabled?: boolean;
   token?: string;
   groupId?: string;
-  allowFrom?: number[];
-  enabled?: boolean;
-  dmPolicy?: string;
+  allowFrom?: string[];
 }
 
-// Channel-level config living at cfg.channels.vk
-export interface VkConfig {
-  accounts?: Record<string, VkAccount>;
-}
-
-// Normalized account returned by resolveVkAccount
+// Normalized account returned by resolveVkAccount.
+// allowFrom contains raw entries (numeric IDs, screen names, or vk.com URLs);
+// the monitor resolves strings to numeric IDs at startup.
 export interface VkResolvedAccount {
   accountId: string;
   name: string;
@@ -22,39 +18,45 @@ export interface VkResolvedAccount {
   configured: boolean;
   token: string;
   groupId: string;
-  allowFrom: number[];
-  dmPolicy: string;
+  allowFrom: string[];
 }
 
-// Return all account IDs defined under cfg.channels.vk.accounts
-export function listVkAccountIds(cfg: OpenClawConfig): string[] {
-  const vk = (cfg as any).channels?.vk as VkConfig | undefined;
-  return Object.keys(vk?.accounts ?? {});
+// Immutable flat config update: patches cfg.channels.vk directly
+export function setVkConfig(
+  cfg: OpenClawConfig,
+  patch: Record<string, unknown>,
+): OpenClawConfig {
+  return {
+    ...cfg,
+    channels: {
+      ...cfg.channels,
+      vk: {
+        ...(cfg as any).channels?.vk,
+        ...patch,
+      },
+    },
+  };
 }
 
-// Resolve a single account into a normalized VkResolvedAccount.
-// When accountId is omitted, falls back to the first available account.
+// Single-account: always "default"
+export function listVkAccountIds(_cfg: OpenClawConfig): string[] {
+  return ["default"];
+}
+
+// Resolve the flat VK config into a normalized VkResolvedAccount.
 export function resolveVkAccount(
   cfg: OpenClawConfig,
-  accountId?: string,
+  _accountId?: string,
 ): VkResolvedAccount {
   const vk = (cfg as any).channels?.vk as VkConfig | undefined;
-  const accounts = vk?.accounts ?? {};
-
-  const id = accountId ?? Object.keys(accounts)[0] ?? "default";
-  const acct: VkAccount = accounts[id] ?? {};
-
-  const token = acct.token ?? "";
-  const groupId = acct.groupId ?? "";
 
   return {
-    accountId: id,
-    name: id,
-    enabled: acct.enabled !== false,
-    configured: Boolean(token && groupId),
-    token,
-    groupId,
-    allowFrom: acct.allowFrom ?? [],
-    dmPolicy: acct.dmPolicy ?? "allow",
+    accountId: "default",
+    name: "default",
+    enabled: vk?.enabled !== false,
+    configured: Boolean(vk?.token && vk?.groupId),
+    token: vk?.token ?? "",
+    groupId: vk?.groupId ?? "",
+    allowFrom: vk?.allowFrom ?? [],
   };
 }

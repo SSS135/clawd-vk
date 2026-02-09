@@ -10,3 +10,14 @@ export function getVkRuntime(): PluginRuntime {
   if (!runtime) throw new Error("VK runtime not initialized");
   return runtime;
 }
+
+// Channel logger created from PluginRuntime.logging
+let _log: { info: (msg: string) => void; error: (msg: string) => void; debug?: (msg: string) => void } | null = null;
+
+export function getVkLog() {
+  if (!_log) {
+    const rt = getVkRuntime();
+    _log = rt.logging.getChildLogger({ subsystem: "vk" });
+  }
+  return _log;
+}

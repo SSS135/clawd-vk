@@ -1,17 +1,19 @@
-import type { PluginRuntime } from "openclaw/plugin-sdk";
 import { getVkRuntime } from "./runtime.js";
+import { getVkLog } from "./runtime.js";
 import { resolveVkAccount } from "./types.js";
 import {
   sendVkMessage,
   getGroupInfo,
   getLongPollServer,
   pollLongPoll,
+  resolveScreenName,
 } from "./vk-api.js";
 
 interface MonitorOpts {
-  runtime?: PluginRuntime;
+  cfg?: any;
   abortSignal?: AbortSignal;
   accountId?: string;
+  setStatus?: (patch: Record<string, unknown>) => void;
 }
 
 const DEDUP_CAP = 2000;
@@ -24,8 +26,9 @@ function sleep(ms: number): Promise<void> {
 // Long Poll monitor loop. Polls VK for new messages and dispatches
 // them through the OpenClaw agent pipeline.
 export async function monitorVkProvider(opts: MonitorOpts): Promise<void> {
-  const core = opts.runtime ?? getVkRuntime();
-  const cfg = core.config;
+  const core = getVkRuntime();
+  const log = getVkLog();
+  const cfg = opts.cfg ?? core.config.loadConfig();
   const acct = resolveVkAccount(cfg, opts.accountId);
 
   if (!acct.configured) {
@@ -34,15 +37,33 @@ export async function monitorVkProvider(opts: MonitorOpts): Promise<void> {
     );
   }
 
-  const { token, groupId, accountId, allowFrom } = acct;
+  const { token, groupId, accountId } = acct;
   const signal = opts.abortSignal;
 
   // Verify token by fetching community info
   const groupInfo = await getGroupInfo(token, groupId);
-  core.log?.(`[vk] Connected to community: ${groupInfo.name} (id: ${groupInfo.id})`);
+  log.info(`[${accountId}] connected to community: ${groupInfo.name} (id: ${groupInfo.id})`);
+
+  // Resolve allowFrom entries: pure-numeric strings are parsed directly,
+  // others (screen names or vk.com URLs) are resolved via API
+  const allowFrom: number[] = [];
+  for (const entry of acct.allowFrom) {
+    if (/^\d+$/.test(entry)) {
+      allowFrom.push(Number(entry));
+    } else {
+      const id = await resolveScreenName(token, entry);
+      if (id) {
+        log.info(`[${accountId}] resolved allowFrom "${entry}" → ${id}`);
+        allowFrom.push(id);
+      } else {
+        log.error(`[${accountId}] could not resolve allowFrom "${entry}" — skipping`);
+      }
+    }
+  }
 
   // Obtain initial Long Poll server credentials
   let lp = await getLongPollServer(token, groupId);
+  log.info(`[${accountId}] long poll started (allowFrom: ${allowFrom.length ? allowFrom.join(", ") : "none — blocking all"})`);
 
   // Dedup set prevents reprocessing the same message.
   // Evicts oldest half when it exceeds DEDUP_CAP.
@@ -54,12 +75,12 @@ export async function monitorVkProvider(opts: MonitorOpts): Promise<void> {
       data = await pollLongPoll(lp.server, lp.key, lp.ts);
     } catch (err) {
       if (signal?.aborted) break;
-      core.error?.(`[vk] Poll error: ${String(err)}`);
+      log.error(`[${accountId}] poll error: ${String(err)}`);
       await sleep(RECONNECT_DELAY_MS);
       try {
         lp = await getLongPollServer(token, groupId);
       } catch (refetchErr) {
-        core.error?.(`[vk] Failed to re-fetch LP server: ${String(refetchErr)}`);
+        log.error(`[${accountId}] failed to re-fetch LP server: ${String(refetchErr)}`);
       }
       continue;
     }
@@ -74,7 +95,7 @@ export async function monitorVkProvider(opts: MonitorOpts): Promise<void> {
         try {
           lp = await getLongPollServer(token, groupId);
         } catch (refetchErr) {
-          core.error?.(`[vk] Failed to re-fetch LP server: ${String(refetchErr)}`);
+          log.error(`[${accountId}] failed to re-fetch LP server: ${String(refetchErr)}`);
           await sleep(RECONNECT_DELAY_MS);
         }
       }
@@ -113,9 +134,9 @@ export async function monitorVkProvider(opts: MonitorOpts): Promise<void> {
         }
       }
 
-      // Auth: if allowFrom is non-empty, reject unknown senders
-      if (allowFrom.length > 0 && !allowFrom.includes(fromId)) {
-        core.log?.(`[vk] Ignoring message from unauthorized user ${fromId}`);
+      // Auth: reject senders not in the allowFrom list
+      if (!allowFrom.includes(fromId)) {
+        log.info(`[${accountId}] ignoring message from unauthorized user ${fromId}`);
         continue;
       }
 
@@ -154,6 +175,9 @@ export async function monitorVkProvider(opts: MonitorOpts): Promise<void> {
         OriginatingChannel: "vk",
       });
 
+      // Track inbound timestamp in gateway runtime
+      opts.setStatus?.({ lastInboundAt: Date.now() });
+
       // Dispatch through agent pipeline; deliver callback sends VK reply
       await core.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
         ctx: ctxPayload,
@@ -162,15 +186,16 @@ export async function monitorVkProvider(opts: MonitorOpts): Promise<void> {
           deliver: async (payload: any) => {
             if (payload.text) {
               await sendVkMessage(token, peerId, payload.text);
+              opts.setStatus?.({ lastOutboundAt: Date.now() });
             }
           },
           onError: (err: unknown) => {
-            core.error?.(`[vk] reply failed: ${String(err)}`);
+            log.error(`[${accountId}] reply failed: ${String(err)}`);
           },
         },
       });
     }
   }
 
-  core.log?.(`[vk] Monitor shutting down for account "${accountId}"`);
+  log.info(`[${accountId}] monitor shutting down`);
 }

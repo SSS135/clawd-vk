@@ -1,59 +1,74 @@
 # @openclaw/vk
 
-> **Early WIP — not ready for use.** This plugin is under active development and should not be used yet.
-
-VK (VKontakte) channel plugin for OpenClaw. Uses VK Bot Long Poll API with zero dependencies (raw `fetch`).
+VK (VKontakte) channel plugin for [OpenClaw](https://github.com/nicepkg/openclaw). Receives messages via VK Bot Long Poll API and replies through the OpenClaw agent pipeline. Zero runtime dependencies — uses native `fetch`.
 
 ## Setup
 
 ### 1. VK Side
 
-1. Create a VK Community (or use existing)
-2. Go to **Community Management > API Usage**
-3. Generate a **group access token**
-4. Enable **Incoming messages** in Long Poll API settings
-5. Note the **Group ID** (numeric, without minus sign)
+1. Create a VK community (or use an existing one)
+2. **Manage > API usage > Create token** — grant the `messages` permission
+3. Note the numeric **Group ID**
 
-### 2. Link Plugin
-
-Symlink into your OpenClaw extensions directory:
+### 2. Install
 
 ```bash
-# Linux/macOS
-ln -s /path/to/clawd-vk extensions/vk
+# npm (when published)
+openclaw install @openclaw/vk
 
-# Windows (PowerShell as admin)
-New-Item -ItemType SymbolicLink -Path extensions\vk -Target C:\path\to\clawd-vk
+# or symlink locally
+ln -s /path/to/clawd-vk extensions/vk          # Linux/macOS
+New-Item -ItemType SymbolicLink -Path extensions\vk -Target C:\path\to\clawd-vk  # Windows (admin)
 ```
 
-### 3. Configure & Run
+### 3. Configure
 
 ```bash
-openclaw setup    # Select VK channel, enter token + group ID
-openclaw start    # Starts Long Poll monitor
+openclaw setup   # interactive wizard — prompts for token, group ID, allowFrom
 ```
 
-## Files
+The wizard detects `VK_TOKEN` in the environment and offers to use it instead of storing the token in config.
 
-| File | Purpose |
-|---|---|
-| `index.ts` | Entry point — registers VK channel plugin |
-| `src/runtime.ts` | Singleton `PluginRuntime` holder |
-| `src/vk-api.ts` | VK API wrapper (zero dependencies, raw fetch) |
-| `src/types.ts` | Account types + config resolution |
-| `src/channel.ts` | `ChannelPlugin` object (config, outbound, gateway, status) |
-| `src/monitor.ts` | Long Poll loop + OpenClaw message dispatch |
+Config is stored flat at `cfg.channels.vk`:
+
+```jsonc
+{
+  "token": "vk1.a...",
+  "groupId": "123456789",
+  "allowFrom": ["61888439", "durov", "https://vk.com/sss135"],
+  "enabled": true
+}
+```
+
+`allowFrom` accepts numeric user IDs, screen names, or full `vk.com` profile URLs — all resolved to numeric IDs at monitor startup.
+
+## Architecture
+
+```
+index.ts            register plugin with OpenClaw, stash PluginRuntime
+src/channel.ts      ChannelPlugin — config CRUD, outbound send, gateway, status probe
+src/onboarding.ts   interactive setup wizard (ChannelOnboardingAdapter)
+src/monitor.ts      Long Poll loop — dedup, auth, routing, agent dispatch
+src/vk-api.ts       thin VK API wrapper (POST URLSearchParams, API v5.199)
+src/types.ts        VkConfig / VkResolvedAccount, flat config helpers
+src/runtime.ts      PluginRuntime singleton + child logger
+```
+
+Single-account model — account ID is always `"default"`.
+
+### Message flow
+
+1. `monitor` obtains Long Poll credentials and enters poll loop
+2. Incoming `message_new` events are deduplicated (bounded set, cap 2000) and auth-checked against `allowFrom`
+3. `core.channel.routing` resolves the target agent; message is wrapped in an agent envelope
+4. `core.channel.reply.dispatchReplyWithBufferedBlockDispatcher` runs the agent and streams reply blocks back via `messages.send`
+
+`peer_id >= 2 000 000 000` → group chat; below → DM.
 
 ## Standalone Test
 
 Test VK connectivity without OpenClaw:
 
 ```bash
-VK_TOKEN=your_token VK_GROUP_ID=your_id node test-vk.mjs
-```
-
-Or with Node.js 20.6+:
-
-```bash
-node --env-file=.env test-vk.mjs
+VK_TOKEN=... VK_GROUP_ID=... node test-vk.mjs
 ```

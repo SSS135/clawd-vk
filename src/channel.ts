@@ -1,28 +1,31 @@
 import type { ChannelPlugin, OpenClawConfig } from "openclaw/plugin-sdk";
 import type { VkResolvedAccount } from "./types.js";
-import { listVkAccountIds, resolveVkAccount } from "./types.js";
+import { resolveVkAccount, setVkConfig } from "./types.js";
 import { vkApi, getGroupInfo } from "./vk-api.js";
 import { monitorVkProvider } from "./monitor.js";
+import { vkOnboardingAdapter } from "./onboarding.js";
 
-// JSON Schema describing the cfg.channels.vk section
+// Flat JSON Schema for cfg.channels.vk — no accounts nesting, no dmPolicy
 const vkChannelConfigSchema = {
-  type: "object" as const,
-  properties: {
-    accounts: {
-      type: "object" as const,
-      additionalProperties: {
-        type: "object" as const,
-        properties: {
-          token: { type: "string" as const },
-          groupId: { type: "string" as const },
-          allowFrom: {
-            type: "array" as const,
-            items: { type: "number" as const },
-          },
-          enabled: { type: "boolean" as const },
-          dmPolicy: { type: "string" as const },
-        },
-      },
+  schema: {
+    type: "object",
+    properties: {
+      token: { type: "string" },
+      groupId: { type: "string" },
+      allowFrom: { type: "array", items: { type: "string" } },
+    },
+  },
+  uiHints: {
+    token: {
+      label: "Community Bot Token",
+      help: "VK API token with messages permission. Get from Community Management > API Usage.",
+      sensitive: true,
+      placeholder: "vk1.a...",
+    },
+    groupId: {
+      label: "Group ID",
+      help: "Numeric VK community (group) ID.",
+      placeholder: "123456789",
     },
   },
 };
@@ -30,19 +33,18 @@ const vkChannelConfigSchema = {
 // Shared send logic used by both sendText and sendMedia
 async function deliverText(
   cfg: OpenClawConfig,
-  accountId: string,
+  _accountId: string,
   to: string,
   text: string,
 ): Promise<{ channel: "vk"; messageId: string }> {
-  const acct = resolveVkAccount(cfg, accountId);
+  const acct = resolveVkAccount(cfg);
   if (!acct.configured) {
-    throw new Error(`VK account "${accountId}" is not configured`);
+    throw new Error(`VK is not configured (missing token or groupId)`);
   }
   const peerId = Number(to);
   if (Number.isNaN(peerId)) {
     throw new Error(`Invalid VK peer_id: ${to}`);
   }
-  // messages.send returns the sent message ID
   const messageId = await vkApi(acct.token, "messages.send", {
     peer_id: peerId,
     message: text,
@@ -62,54 +64,55 @@ export const vkPlugin: ChannelPlugin<VkResolvedAccount> = {
   },
   capabilities: { chatTypes: ["direct", "group"] },
   configSchema: vkChannelConfigSchema,
+  onboarding: vkOnboardingAdapter,
+
+  setup: {
+    applyAccountConfig({ cfg, input }) {
+      const patch: Record<string, unknown> = { enabled: true };
+      if (input.token?.trim()) {
+        patch.token = input.token.trim();
+      }
+      const raw = input as Record<string, unknown>;
+      if (typeof raw.groupId === "string" && raw.groupId.trim()) {
+        patch.groupId = raw.groupId.trim();
+      }
+      return setVkConfig(cfg, patch);
+    },
+    validateInput({ input }) {
+      const raw = input as Record<string, unknown>;
+      if (!input.token?.trim() && !(typeof raw.groupId === "string" && raw.groupId.trim())) {
+        return "VK requires a community bot token and group ID";
+      }
+      return null;
+    },
+  },
 
   config: {
-    listAccountIds(cfg: OpenClawConfig): string[] {
-      return listVkAccountIds(cfg);
-    },
+    listAccountIds: () => ["default"],
 
-    resolveAccount(
-      cfg: OpenClawConfig,
-      accountId: string,
-    ): VkResolvedAccount {
-      return resolveVkAccount(cfg, accountId);
-    },
+    resolveAccount: (cfg: OpenClawConfig) => resolveVkAccount(cfg),
 
-    defaultAccountId(cfg: OpenClawConfig): string | undefined {
-      const ids = listVkAccountIds(cfg);
-      return ids[0];
-    },
+    defaultAccountId: () => "default",
 
-    setAccountEnabled(
-      cfg: OpenClawConfig,
-      accountId: string,
-      enabled: boolean,
-    ): void {
-      const channels = ((cfg as any).channels ??= {});
-      const vk = (channels.vk ??= {});
-      const accounts = (vk.accounts ??= {});
-      const acct = (accounts[accountId] ??= {});
-      acct.enabled = enabled;
-    },
+    setAccountEnabled: ({ cfg, enabled }) => setVkConfig(cfg, { enabled }),
 
-    deleteAccount(cfg: OpenClawConfig, accountId: string): void {
-      const vk = (cfg as any).channels?.vk;
-      if (vk?.accounts) {
-        delete vk.accounts[accountId];
-      }
-    },
+    deleteAccount: ({ cfg }) => ({
+      ...cfg,
+      channels: {
+        ...cfg.channels,
+        vk: {},
+      },
+    }),
 
-    isConfigured(cfg: OpenClawConfig): boolean {
-      return listVkAccountIds(cfg).some(
-        (id) => resolveVkAccount(cfg, id).configured,
-      );
-    },
+    isConfigured: (account: VkResolvedAccount) => account.configured,
 
-    describeAccount(cfg: OpenClawConfig, accountId: string): string {
-      const acct = resolveVkAccount(cfg, accountId);
-      if (!acct.configured) return `${acct.name} (not configured)`;
-      return `${acct.name} (group ${acct.groupId})`;
-    },
+    describeAccount: (account: VkResolvedAccount) => ({
+      accountId: account.accountId,
+      name: account.name,
+      enabled: account.enabled,
+      configured: account.configured,
+      credentialSource: account.configured ? "config" : undefined,
+    }),
   },
 
   outbound: {
@@ -121,7 +124,6 @@ export const vkPlugin: ChannelPlugin<VkResolvedAccount> = {
     },
 
     async sendMedia({ cfg, to, text, mediaUrl, accountId }) {
-      // Append media URL to message body as a simple fallback
       const combined = [text, mediaUrl].filter(Boolean).join("\n");
       return deliverText(cfg, accountId, to, combined);
     },
@@ -130,21 +132,46 @@ export const vkPlugin: ChannelPlugin<VkResolvedAccount> = {
   gateway: {
     async startAccount(ctx) {
       await monitorVkProvider({
-        runtime: ctx.runtime,
+        cfg: ctx.cfg,
         abortSignal: ctx.abortSignal,
         accountId: ctx.accountId,
+        setStatus: ctx.setStatus,
       });
     },
   },
 
   status: {
-    async probeAccount(cfg: OpenClawConfig, accountId: string) {
-      const acct = resolveVkAccount(cfg, accountId);
-      if (!acct.configured) {
+    buildAccountSnapshot({ account, runtime, probe }: {
+      account: VkResolvedAccount;
+      cfg: OpenClawConfig;
+      runtime?: Record<string, unknown>;
+      probe?: unknown;
+    }) {
+      return {
+        accountId: account.accountId,
+        name: account.name,
+        enabled: account.enabled,
+        configured: account.configured,
+        running: (runtime?.running as boolean) ?? false,
+        lastStartAt: (runtime?.lastStartAt as number) ?? null,
+        lastStopAt: (runtime?.lastStopAt as number) ?? null,
+        lastError: (runtime?.lastError as string) ?? null,
+        lastInboundAt: (runtime?.lastInboundAt as number) ?? null,
+        lastOutboundAt: (runtime?.lastOutboundAt as number) ?? null,
+        probe,
+      };
+    },
+
+    async probeAccount({ account }: {
+      account: VkResolvedAccount;
+      timeoutMs: number;
+      cfg: OpenClawConfig;
+    }) {
+      if (!account.configured) {
         return { ok: false, error: "Account not configured (missing token or groupId)" };
       }
       try {
-        const info = await getGroupInfo(acct.token, acct.groupId);
+        const info = await getGroupInfo(account.token, account.groupId);
         return { ok: true, detail: `Connected to group "${info.name}"` };
       } catch (err) {
         return { ok: false, error: String(err) };

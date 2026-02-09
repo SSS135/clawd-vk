@@ -88,6 +88,27 @@ export async function getLongPollServer(
   }) as Promise<VkLongPollServer>;
 }
 
+// Resolve a screen name (or vk.com URL) to a numeric user ID.
+// Returns the numeric ID or null if not found / not a user.
+export async function resolveScreenName(
+  token: string,
+  screenName: string,
+): Promise<number | null> {
+  // Strip vk.com URL prefix if present
+  const name = screenName
+    .replace(/^https?:\/\/(www\.)?vk\.com\//i, "")
+    .replace(/\/.*$/, "")
+    .trim();
+  if (!name) return null;
+
+  const result = await vkApi(token, "utils.resolveScreenName", {
+    screen_name: name,
+  });
+  // API returns empty array or {} when not found
+  if (!result || !result.object_id || result.type !== "user") return null;
+  return result.object_id;
+}
+
 // Single Long Poll GET request. 35 s timeout covers the 25 s wait param.
 export async function pollLongPoll(
   server: string,
