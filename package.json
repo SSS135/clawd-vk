@@ -1,0 +1,21 @@
+{
+  "name": "@openclaw/vk",
+  "version": "0.0.1",
+  "type": "module",
+  "openclaw": {
+    "extensions": ["./index.ts"],
+    "channel": {
+      "id": "vk",
+      "label": "VK",
+      "selectionLabel": "VK (VKontakte)",
+      "docsPath": "/channels/vk",
+      "blurb": "VK Bot API via Long Poll",
+      "order": 95
+    },
+    "install": {
+      "npmSpec": "@openclaw/vk",
+      "localPath": "extensions/vk",
+      "defaultChoice": "npm"
+    }
+  }
+}
