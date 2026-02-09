@@ -72,10 +72,10 @@ export async function getGroupInfo(
   token: string,
   groupId: string | number,
 ): Promise<VkGroupInfo> {
-  const response: VkGroupInfo[] = await vkApi(token, "groups.getById", {
+  const response = await vkApi(token, "groups.getById", {
     group_id: groupId,
   });
-  return response[0];
+  return (response.groups ?? response)[0];
 }
 
 // Obtain Long Poll server credentials for a community.
