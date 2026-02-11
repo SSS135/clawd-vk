@@ -12,6 +12,8 @@ import {
   uploadPhotoForMessage,
   uploadDocForMessage,
 } from "./vk-api.js";
+import { convertToOggOpus } from "./audio-convert.js";
+import { loadMedia } from "./media-loader.js";
 
 interface MonitorOpts {
   cfg?: any;
@@ -100,7 +102,6 @@ async function uploadMediaToVk(
   buffer: Buffer,
   contentType: string,
   kind: string,
-  audioAsVoice: boolean,
   log: ReturnType<typeof getVkLog>,
 ): Promise<string | null> {
   try {
@@ -109,12 +110,10 @@ async function uploadMediaToVk(
       return await uploadPhotoForMessage(token, peerId, buffer, `image.${ext}`);
     }
     if (kind === "audio") {
-      // VK audio_message requires OGG Opus; use it for ogg, fall back to doc for other audio
-      const isOgg = contentType.includes("ogg");
-      if (isOgg) {
-        return await uploadDocForMessage(token, peerId, buffer, `voice.ogg`, "audio_message");
-      }
-      return await uploadDocForMessage(token, peerId, buffer, `audio.${ext}`, "doc");
+      // VK rejects audio as doc (wrong_music_file) and requires OGG Opus for audio_message;
+      // convert to OGG Opus via ffmpeg then upload as audio_message
+      const oggBuffer = convertToOggOpus(buffer, ext);
+      return await uploadDocForMessage(token, peerId, oggBuffer, "voice.ogg", "audio_message");
     }
     // Everything else (documents, video, unknown) → doc upload
     return await uploadDocForMessage(token, peerId, buffer, `file.${ext}`, "doc");
@@ -317,11 +316,16 @@ export async function monitorVkProvider(opts: MonitorOpts): Promise<void> {
             for (const url of mediaUrls) {
               if (!url) continue;
               try {
-                const loaded = await core.media.loadWebMedia(url);
+                const loaded = await loadMedia(url);
                 const kind = core.media.mediaKindFromMime(loaded.contentType ?? "");
+                // Skip TTS audio unless explicitly requested as voice
+                if (kind === "audio" && !audioAsVoice) {
+                  log.info(`[${accountId}] skipping audio attachment (audioAsVoice=false)`);
+                  continue;
+                }
                 const attStr = await uploadMediaToVk(
                   token, peerId, loaded.buffer, loaded.contentType ?? "application/octet-stream",
-                  kind, audioAsVoice, log,
+                  kind, log,
                 );
                 if (attStr) attachmentStrings.push(attStr);
                 else failedUrls.push(url);
@@ -335,8 +339,11 @@ export async function monitorVkProvider(opts: MonitorOpts): Promise<void> {
               ? attachmentStrings.join(",")
               : undefined;
 
-            // Fallback: include failed media URLs in the text so they're not silently dropped
-            const msgText = [payload.text, ...failedUrls].filter(Boolean).join("\n");
+            // Log failed URLs but don't leak local paths to VK users
+            if (failedUrls.length > 0) {
+              log.error(`[${accountId}] failed media: ${failedUrls.join(", ")}`);
+            }
+            const msgText = payload.text ?? "";
 
             if (msgText || attachment) {
               await sendVkMessage(token, peerId, msgText, attachment);

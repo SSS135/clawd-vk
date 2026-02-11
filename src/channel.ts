@@ -2,6 +2,8 @@ import type { ChannelPlugin, OpenClawConfig } from "openclaw/plugin-sdk";
 import type { VkResolvedAccount } from "./types.js";
 import { resolveVkAccount, setVkConfig } from "./types.js";
 import { vkApi, getGroupInfo, uploadPhotoForMessage, uploadDocForMessage } from "./vk-api.js";
+import { convertToOggOpus } from "./audio-convert.js";
+import { loadMedia } from "./media-loader.js";
 import { monitorVkProvider } from "./monitor.js";
 import { vkOnboardingAdapter } from "./onboarding.js";
 import { getVkRuntime, getVkLog } from "./runtime.js";
@@ -31,13 +33,18 @@ const vkChannelConfigSchema = {
   },
 };
 
+// Strip channel prefix from target (agent tools pass "vk:12345")
+function stripVkPrefix(to: string): string {
+  return to.replace(/^vk:/i, "").trim();
+}
+
 // Resolve account and peer_id, validate config
 function resolveTarget(cfg: OpenClawConfig, to: string) {
   const acct = resolveVkAccount(cfg);
   if (!acct.configured) {
     throw new Error(`VK is not configured (missing token or groupId)`);
   }
-  const peerId = Number(to);
+  const peerId = Number(stripVkPrefix(to));
   if (Number.isNaN(peerId)) {
     throw new Error(`Invalid VK peer_id: ${to}`);
   }
@@ -72,31 +79,31 @@ async function deliverMedia(
   const log = getVkLog();
   const core = getVkRuntime();
 
-  let attachment: string | undefined;
-  try {
-    const loaded = await core.media.loadWebMedia(mediaUrl);
-    const kind = core.media.mediaKindFromMime(loaded.contentType ?? "");
-    const ext = (loaded.contentType ?? "").split("/")[1]?.split(";")[0] ?? "bin";
+  // Load and upload media; throw on failure so the agent sees the real error
+  const loaded = await loadMedia(mediaUrl);
+  const kind = core.media.mediaKindFromMime(loaded.contentType ?? "");
+  const ext = (loaded.contentType ?? "").split("/")[1]?.split(";")[0] ?? "bin";
+  log.info(`deliverMedia: mediaUrl=${mediaUrl} kind=${kind} contentType=${loaded.contentType} size=${loaded.buffer.length} ext=${ext}`);
 
-    if (kind === "image") {
-      attachment = await uploadPhotoForMessage(acct.token, peerId, loaded.buffer, `image.${ext}`);
-    } else if (kind === "audio" && (loaded.contentType ?? "").includes("ogg")) {
-      attachment = await uploadDocForMessage(acct.token, peerId, loaded.buffer, `voice.ogg`, "audio_message");
-    } else {
-      attachment = await uploadDocForMessage(acct.token, peerId, loaded.buffer, loaded.fileName ?? `file.${ext}`, "doc");
-    }
-  } catch (err) {
-    log.error(`VK sendMedia upload failed: ${String(err)}`);
+  let attachment: string;
+  if (kind === "image") {
+    attachment = await uploadPhotoForMessage(acct.token, peerId, loaded.buffer, `image.${ext}`);
+  } else if (kind === "audio") {
+    const oggBuffer = convertToOggOpus(loaded.buffer, ext);
+    log.info(`deliverMedia: converted to OGG Opus, size=${oggBuffer.length}`);
+    attachment = await uploadDocForMessage(acct.token, peerId, oggBuffer, "voice.ogg", "audio_message");
+  } else {
+    attachment = await uploadDocForMessage(acct.token, peerId, loaded.buffer, loaded.fileName ?? `file.${ext}`, "doc");
   }
+  log.info(`deliverMedia: attachment=${attachment}`);
 
-  // Send with attachment if upload succeeded, otherwise fall back to text + URL
-  const msgText = attachment ? text : [text, mediaUrl].filter(Boolean).join("\n");
   const messageId = await vkApi(acct.token, "messages.send", {
     peer_id: peerId,
-    ...(msgText ? { message: msgText } : {}),
-    ...(attachment ? { attachment } : {}),
+    ...(text ? { message: text } : {}),
+    attachment,
     random_id: Math.floor(Math.random() * 2 ** 31),
   });
+  log.info(`deliverMedia: sent messageId=${messageId}`);
   return { channel: "vk", messageId: String(messageId) };
 }
 

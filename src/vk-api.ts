@@ -144,9 +144,10 @@ export async function uploadDocForMessage(
   const saved = await vkApi(token, "docs.save", {
     file: uploadData.file,
   });
-  const doc = saved.doc ?? saved;
-  const prefix = type === "audio_message" ? "audio_message" : "doc";
-  return `${prefix}${doc.owner_id}_${doc.id}`;
+  console.log("[vk-api] docs.save response:", JSON.stringify(saved));
+  const doc = saved.doc ?? saved.audio_message ?? saved;
+  // Always use "doc" prefix — VK auto-detects audio_message from upload type
+  return `doc${doc.owner_id}_${doc.id}`;
 }
 
 // Fetch community info. Returns the first group object.
