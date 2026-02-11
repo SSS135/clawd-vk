@@ -3,7 +3,9 @@
   "version": "0.0.1",
   "type": "module",
   "openclaw": {
-    "extensions": ["./index.ts"],
+    "extensions": [
+      "./index.ts"
+    ],
     "channel": {
       "id": "vk",
       "label": "VK",
@@ -17,5 +19,8 @@
       "localPath": "extensions/vk",
       "defaultChoice": "npm"
     }
+  },
+  "dependencies": {
+    "@ffmpeg-installer/ffmpeg": "^1.1.0"
   }
 }
